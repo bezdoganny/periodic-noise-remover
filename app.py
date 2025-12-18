@@ -79,7 +79,6 @@ def qimage_to_numpy_rgb(img: QImage) -> np.ndarray:
     arr = np.frombuffer(ptr, np.uint8)
     arr = arr.reshape((h, bytes_per_line))
 
-    # ⚠️ відкидаємо padding
     arr = arr[:, :w * 3]
 
     return arr.reshape((h, w, 3)).copy()
