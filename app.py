@@ -31,13 +31,12 @@ from PyQt5.QtWidgets import (
     QShortcut,
 )
 
-
-# ===== Допоміжні функції для NumPy <-> QImage =====
+# =============================================================================
+# NumPy <-> QImage helpers
+# =============================================================================
 
 def numpy_to_qimage_gray(arr: np.ndarray) -> QImage:
-    """
-    Перетворює 2D NumPy (uint8) у QImage (Format_Grayscale8).
-    """
+    """2D uint8 -> QImage Grayscale8"""
     if arr.dtype != np.uint8:
         arr = arr.astype(np.uint8)
     h, w = arr.shape
@@ -46,9 +45,7 @@ def numpy_to_qimage_gray(arr: np.ndarray) -> QImage:
 
 
 def qimage_to_numpy_gray(img: QImage) -> np.ndarray:
-    """
-    Перетворює QImage (Format_Grayscale8) у 2D NumPy (uint8).
-    """
+    """QImage -> 2D uint8 (grayscale)"""
     img = img.convertToFormat(QImage.Format_Grayscale8)
     w = img.width()
     h = img.height()
@@ -59,7 +56,37 @@ def qimage_to_numpy_gray(img: QImage) -> np.ndarray:
     return arr[:, :w].copy()
 
 
-# ===== ZoomableGraphicsView (Ctrl + колесо = zoom) =====
+def numpy_to_qimage_rgb(arr: np.ndarray) -> QImage:
+    """H x W x 3 uint8 (RGB) -> QImage RGB888"""
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8)
+    h, w, ch = arr.shape
+    assert ch == 3, "RGB array must have 3 channels"
+    bytes_per_line = 3 * w
+    qimg = QImage(arr.data, w, h, bytes_per_line, QImage.Format_RGB888)
+    return qimg.copy()
+
+
+def qimage_to_numpy_rgb(img: QImage) -> np.ndarray:
+    img = img.convertToFormat(QImage.Format_RGB888)
+
+    w, h = img.width(), img.height()
+    bytes_per_line = img.bytesPerLine()
+
+    ptr = img.bits()
+    ptr.setsize(h * bytes_per_line)
+
+    arr = np.frombuffer(ptr, np.uint8)
+    arr = arr.reshape((h, bytes_per_line))
+
+    # ⚠️ відкидаємо padding
+    arr = arr[:, :w * 3]
+
+    return arr.reshape((h, w, 3)).copy()
+
+# =============================================================================
+# Zoomable view (Ctrl+wheel)
+# =============================================================================
 
 class ZoomableGraphicsView(QGraphicsView):
     def __init__(self, parent=None):
@@ -70,18 +97,16 @@ class ZoomableGraphicsView(QGraphicsView):
 
     def wheelEvent(self, event):
         if QApplication.keyboardModifiers() == Qt.ControlModifier:
-            # Масштабування
-            if event.angleDelta().y() > 0:
-                factor = 1.1
-            else:
-                factor = 1 / 1.1
+            factor = 1.1 if event.angleDelta().y() > 0 else (1 / 1.1)
             self._zoom_factor *= factor
             self.scale(factor, factor)
         else:
             super().wheelEvent(event)
 
 
-# ===== Вікно DFT, по якому малюємо =====
+# =============================================================================
+# DFT drawing view
+# =============================================================================
 
 class DFTView(ZoomableGraphicsView):
     def __init__(self, editor, parent=None):
@@ -93,9 +118,6 @@ class DFTView(ZoomableGraphicsView):
         self.last_point = None
 
     def map_to_image_point(self, event_pos):
-        """
-        Переводимо координати миші в координати зображення в сцені.
-        """
         scene_pos = self.mapToScene(event_pos)
         if self.editor.dft_pixmap_item is None:
             return None
@@ -113,9 +135,8 @@ class DFTView(ZoomableGraphicsView):
                 self.drawing = True
                 self.start_point = img_point
                 self.last_point = img_point
-                self.editor.begin_stroke()  # зберігаємо маску для Undo
+                self.editor.begin_stroke()
 
-                # Олівець / ластик – малюємо одразу
                 if self.editor.current_tool in ("pencil", "eraser"):
                     self.editor.paint_segment(self.last_point, img_point)
                     self.editor.update_from_mask()
@@ -137,7 +158,6 @@ class DFTView(ZoomableGraphicsView):
             if img_point is not None:
                 tool = self.editor.current_tool
                 if tool in ("pencil", "eraser"):
-                    # все вже домальовано по ходу руху
                     pass
                 elif tool == "line":
                     self.editor.paint_line(self.start_point, img_point)
@@ -145,6 +165,7 @@ class DFTView(ZoomableGraphicsView):
                     self.editor.paint_circle(self.start_point, img_point, inverse=False)
                 elif tool == "inv_circle":
                     self.editor.paint_circle(self.start_point, img_point, inverse=True)
+
                 self.editor.update_from_mask()
 
             self.drawing = False
@@ -153,7 +174,9 @@ class DFTView(ZoomableGraphicsView):
         super().mouseReleaseEvent(event)
 
 
-# ===== Головне вікно FourierEditor =====
+# =============================================================================
+# Main window
+# =============================================================================
 
 class FourierEditor(QMainWindow):
     def __init__(self):
@@ -162,40 +185,49 @@ class FourierEditor(QMainWindow):
         self.setWindowTitle("Vitalik's periodic noise remover")
         self.resize(1200, 700)
 
-        # Стан
+        # State
         self.image_loaded = False
-        self.original_image = None    # NumPy, grayscale, float32
-        self.dft_complex = None       # комплексний спектр
-        self.mask_image = None        # QImage (маска спектра)
 
-        self.undo_stack = []          # список масок (QImage)
+        self.original_rgb = None      # HxWx3 uint8 (RGB)
+        self.original_gray = None     # HxW float32 (luma)
+        self.dft_complex = None       # complex spectrum (shifted)
+        self.mask_image = None        # QImage grayscale mask (0..255)
+
+        self.undo_stack = []
         self.redo_stack = []
 
-        self.current_tool = "pencil"  # pencil | line | circle | inv_circle | eraser
+        self.current_tool = "pencil"
         self.brush_thickness = 5
-        self.brush_intensity = 0      # 0 – чорний, 255 – білий
+        self.brush_intensity = 0  # 0 black (strong suppress), 255 white (no change)
 
-        # Приймаємо drop
+        self.last_result_rgb = None  # store latest processed RGB (uint8)
+
         self.setAcceptDrops(True)
 
-        # Інтерфейс
         self._create_toolbar()
         self._create_central_widgets()
         self._create_shortcuts()
 
-    # ---------- Toolbar ----------
+    # -------------------------------------------------------------------------
+    # Toolbar (IMPORTANT: shortcuts live here to avoid "Ambiguous shortcut overload")
+    # -------------------------------------------------------------------------
 
     def _create_toolbar(self):
         toolbar = QToolBar("Main Toolbar", self)
         self.addToolBar(toolbar)
 
-        # Open
-        open_action = QAction("Open", self)
+        open_action = QAction("Відкрити", self)
         open_action.setShortcut(QKeySequence("Ctrl+O"))
         open_action.triggered.connect(self.open_image)
         toolbar.addAction(open_action)
 
-        # Undo / Redo
+        save_action = QAction("Зберегти  ", self)
+        save_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_action.triggered.connect(self.save_image)
+        toolbar.addAction(save_action)
+
+        toolbar.addSeparator()
+
         undo_action = QAction("Undo", self)
         undo_action.setShortcut(QKeySequence("Ctrl+Z"))
         undo_action.triggered.connect(self.undo)
@@ -206,44 +238,41 @@ class FourierEditor(QMainWindow):
         redo_action.triggered.connect(self.redo)
         toolbar.addAction(redo_action)
 
-        reset_action = QAction("Reset", self)
+        reset_action = QAction("Відновити", self)
         reset_action.triggered.connect(self.reset_mask)
         toolbar.addAction(reset_action)
 
         toolbar.addSeparator()
 
-        # Вибір інструмента
         self.tool_combo = QComboBox()
-        self.tool_combo.addItem("Pencil", "pencil")
-        self.tool_combo.addItem("Line", "line")
-        self.tool_combo.addItem("Filled circle", "circle")
-        self.tool_combo.addItem("Inverse circle", "inv_circle")
-        self.tool_combo.addItem("Eraser", "eraser")
+        self.tool_combo.addItem("Олівець", "pencil")
+        self.tool_combo.addItem("Лінія", "line")
+        self.tool_combo.addItem("Круг", "circle")
+        self.tool_combo.addItem("Зворотній круг", "inv_circle")
+        self.tool_combo.addItem("Гумка", "eraser")
         self.tool_combo.currentIndexChanged.connect(self._tool_changed)
-        toolbar.addWidget(QLabel(" Tool: "))
+        toolbar.addWidget(QLabel(" Інструмент: "))
         toolbar.addWidget(self.tool_combo)
 
-        # Товщина
         self.thickness_slider = QSlider(Qt.Horizontal)
         self.thickness_slider.setMinimum(1)
         self.thickness_slider.setMaximum(50)
         self.thickness_slider.setValue(self.brush_thickness)
         self.thickness_slider.valueChanged.connect(self._thickness_changed)
-        toolbar.addWidget(QLabel("  Thickness: "))
+        toolbar.addWidget(QLabel("  Товщина: "))
         toolbar.addWidget(self.thickness_slider)
 
-        # Відтінок чорного
-        # 0   = чорний   (максимальне приглушення)
-        # 255 = білий    (без змін)
         self.intensity_slider = QSlider(Qt.Horizontal)
         self.intensity_slider.setMinimum(0)
         self.intensity_slider.setMaximum(255)
         self.intensity_slider.setValue(self.brush_intensity)
         self.intensity_slider.valueChanged.connect(self._intensity_changed)
-        toolbar.addWidget(QLabel("  Shade (0=black, 255=white): "))
+        toolbar.addWidget(QLabel("  Непрозорість: "))
         toolbar.addWidget(self.intensity_slider)
 
-    # ---------- Центральна область (дві сцени) ----------
+    # -------------------------------------------------------------------------
+    # Central UI
+    # -------------------------------------------------------------------------
 
     def _create_central_widgets(self):
         central = QWidget()
@@ -252,11 +281,10 @@ class FourierEditor(QMainWindow):
         layout = QHBoxLayout()
         central.setLayout(layout)
 
-        # Ліва частина – DFT
         left_layout = QVBoxLayout()
         layout.addLayout(left_layout)
 
-        lbl_dft = QLabel("DFT (спектр, по якому ми малюємо)")
+        lbl_dft = QLabel("Спектр Фур'є:")
         left_layout.addWidget(lbl_dft)
 
         self.dft_scene = QGraphicsScene(self)
@@ -264,11 +292,10 @@ class FourierEditor(QMainWindow):
         self.dft_view.setScene(self.dft_scene)
         left_layout.addWidget(self.dft_view)
 
-        # Права частина – відновлене зображення
         right_layout = QVBoxLayout()
         layout.addLayout(right_layout)
 
-        lbl_img = QLabel("Відновлене зображення після змін у DFT")
+        lbl_img = QLabel("Результат:")
         right_layout.addWidget(lbl_img)
 
         self.img_scene = QGraphicsScene(self)
@@ -276,26 +303,21 @@ class FourierEditor(QMainWindow):
         self.img_view.setScene(self.img_scene)
         right_layout.addWidget(self.img_view)
 
-        # Елементи сцени
         self.dft_pixmap_item = None
         self.img_pixmap_item = None
 
-    # ---------- Шорткати ----------
+    # -------------------------------------------------------------------------
+    # Ctrl+C, Ctrl+V
+    # -------------------------------------------------------------------------
 
     def _create_shortcuts(self):
-        # Undo
-        QShortcut(QKeySequence("Ctrl+Z"), self, activated=self.undo)
-        # Redo класичний
-        QShortcut(QKeySequence("Ctrl+Y"), self, activated=self.redo)
-        # Redo як у Photoshop
-        QShortcut(QKeySequence("Ctrl+Shift+Z"), self, activated=self.redo)
-
-        # Paste image з буфера
+        # Clipboard
         QShortcut(QKeySequence("Ctrl+V"), self, activated=self.paste_image)
-        # Copy image в буфер
         QShortcut(QKeySequence("Ctrl+C"), self, activated=self.copy_image)
 
-    # ---------- Зміна інструментів/параметрів ----------
+    # -------------------------------------------------------------------------
+    # Tool params
+    # -------------------------------------------------------------------------
 
     def _tool_changed(self, index):
         self.current_tool = self.tool_combo.itemData(index)
@@ -306,35 +328,45 @@ class FourierEditor(QMainWindow):
     def _intensity_changed(self, value):
         self.brush_intensity = value
 
-    # ---------- Відкриття / завантаження зображення ----------
+    # -------------------------------------------------------------------------
+    # Open / Load
+    # -------------------------------------------------------------------------
 
     def open_image(self):
         fname, _ = QFileDialog.getOpenFileName(
             self,
             "Виберіть зображення",
             "",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)",
+            "Формат зображення (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)",
         )
         if not fname:
             return
 
-        img = cv2.imread(fname, cv2.IMREAD_GRAYSCALE)
-        if img is None:
+        img_bgr = cv2.imread(fname, cv2.IMREAD_COLOR)
+        if img_bgr is None:
             QMessageBox.warning(self, "Помилка", "Не вдалося відкрити зображення.")
             return
 
-        self.load_new_image(img)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        self.load_new_image(img_rgb)
 
-    def load_new_image(self, arr: np.ndarray):
-        """
-        Завантажити нове зображення (NumPy grayscale) в редактор.
-        """
-        self.original_image = arr.astype(np.float32)
+    def load_new_image(self, rgb_arr: np.ndarray):
+        """Завантажте RGB зображення. """
+        if rgb_arr is None:
+            return
+        if rgb_arr.ndim != 3 or rgb_arr.shape[2] != 3:
+            QMessageBox.warning(self, "Помилка", "Очікувалося кольорове зображення (RGB).")
+            return
+
+        self.original_rgb = rgb_arr.astype(np.uint8)
+
+        gray = cv2.cvtColor(self.original_rgb, cv2.COLOR_RGB2GRAY)
+        self.original_gray = gray.astype(np.float32)
+
         self.image_loaded = True
-
         self.compute_dft()
 
-        h, w = arr.shape
+        h, w = gray.shape
         mask_np = np.full((h, w), 255, dtype=np.uint8)
         self.mask_image = numpy_to_qimage_gray(mask_np)
 
@@ -343,31 +375,24 @@ class FourierEditor(QMainWindow):
 
         self.update_from_mask()
 
-    # ---------- DFT / оновлення вікон ----------
+    # -------------------------------------------------------------------------
+    # DFT / Update
+    # -------------------------------------------------------------------------
 
     def compute_dft(self):
-        """
-        Обчислюємо DFT зображення та зсуваємо нульові частоти в центр.
-        """
-        f = np.fft.fft2(self.original_image)
-        fshift = np.fft.fftshift(f)
-        self.dft_complex = fshift
+        f = np.fft.fft2(self.original_gray)
+        self.dft_complex = np.fft.fftshift(f)
 
     def update_from_mask(self):
-        """
-        Оновлюємо:
-        - вікно DFT (лог-модуль спектра після маскування)
-        - відновлене зображення (IFFT).
-        """
         if not self.image_loaded or self.dft_complex is None or self.mask_image is None:
             return
 
         mask_np = qimage_to_numpy_gray(self.mask_image).astype(np.float32) / 255.0
 
-        # Маскуємо спектр
+        # Mask spectrum (luminance spectrum)
         F_mod = self.dft_complex * mask_np
 
-        # Для DFT-вікна показуємо лог-модуль
+        # DFT view (log magnitude)
         magnitude = np.abs(F_mod)
         magnitude = np.log(1 + magnitude)
         magnitude -= magnitude.min()
@@ -377,24 +402,37 @@ class FourierEditor(QMainWindow):
 
         dft_qimage = numpy_to_qimage_gray(dft_display)
         dft_pixmap = QPixmap.fromImage(dft_qimage)
-
         if self.dft_pixmap_item is None:
             self.dft_pixmap_item = QGraphicsPixmapItem(dft_pixmap)
             self.dft_scene.addItem(self.dft_pixmap_item)
         else:
             self.dft_pixmap_item.setPixmap(dft_pixmap)
 
-        # Відновлюємо зображення через зворотнє перетворення
-        img_recon = np.fft.ifft2(np.fft.ifftshift(F_mod))
-        img_recon = np.real(img_recon)
+        # Reconstruct luminance
+        lum = np.fft.ifft2(np.fft.ifftshift(F_mod))
+        lum = np.real(lum)
 
-        # Нормуємо до [0, 255]
-        img_recon -= img_recon.min()
-        if img_recon.max() > 0:
-            img_recon = img_recon / img_recon.max()
-        img_recon_disp = (img_recon * 255).astype(np.uint8)
+        # Normalize to [0..255]
+        lum -= lum.min()
+        if lum.max() > 0:
+            lum = lum / lum.max()
+        lum_u8 = (lum * 255).astype(np.uint8)
 
-        img_qimage = numpy_to_qimage_gray(img_recon_disp)
+        # Apply luminance ratio to original RGB to keep colors
+        lum_orig = cv2.cvtColor(self.original_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        lum_new = lum_u8.astype(np.float32)
+
+        ratio = lum_new / (lum_orig + 1e-6)
+        ratio = np.clip(ratio, 0.0, 10.0)  # avoid extreme blow-ups
+
+        result = self.original_rgb.astype(np.float32).copy()
+        for c in range(3):
+            result[:, :, c] = np.clip(result[:, :, c] * ratio, 0, 255)
+        result_u8 = result.astype(np.uint8)
+
+        self.last_result_rgb = result_u8
+
+        img_qimage = numpy_to_qimage_rgb(result_u8)
         img_pixmap = QPixmap.fromImage(img_qimage)
 
         if self.img_pixmap_item is None:
@@ -403,36 +441,23 @@ class FourierEditor(QMainWindow):
         else:
             self.img_pixmap_item.setPixmap(img_pixmap)
 
-    # ---------- Малювання по масці ----------
+    # -------------------------------------------------------------------------
+    # Drawing on mask
+    # -------------------------------------------------------------------------
 
     def begin_stroke(self):
-        """
-        Початок "штриха" по масці – зберігаємо поточну маску в undo_stack.
-        """
         if self.mask_image is None:
             return
         self.undo_stack.append(self.mask_image.copy())
         self.redo_stack.clear()
 
     def get_pen_color(self):
-        """
-        Колір інструмента:
-        - Eraser → білий (255)
-        - інші → інтенсивність із повзунка
-        """
-        if self.current_tool == "eraser":
-            intensity = 255
-        else:
-            intensity = self.brush_intensity
+        intensity = 255 if self.current_tool == "eraser" else self.brush_intensity
         return QColor(intensity, intensity, intensity)
 
     def paint_segment(self, p1: QPointF, p2: QPointF):
-        """
-        Малюємо відрізок (для олівця/ластика) між двома точками.
-        """
         if self.mask_image is None:
             return
-
         painter = QPainter(self.mask_image)
         pen = QPen(
             self.get_pen_color(),
@@ -446,12 +471,8 @@ class FourierEditor(QMainWindow):
         painter.end()
 
     def paint_line(self, start: QPointF, end: QPointF):
-        """
-        Малюємо пряму лінію (Line tool).
-        """
         if self.mask_image is None:
             return
-
         painter = QPainter(self.mask_image)
         pen = QPen(
             self.get_pen_color(),
@@ -465,11 +486,6 @@ class FourierEditor(QMainWindow):
         painter.end()
 
     def paint_circle(self, start: QPointF, end: QPointF, inverse=False):
-        """
-        Малюємо коло.
-        - circle: заповнене коло
-        - inv_circle: ВСЯ маска затемнена, всередині кола — біле вікно
-        """
         if self.mask_image is None:
             return
 
@@ -487,26 +503,24 @@ class FourierEditor(QMainWindow):
         painter = QPainter(self.mask_image)
 
         if not inverse:
-            # Звичайне заповнене коло
             pen_color = self.get_pen_color()
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(pen_color, Qt.SolidPattern))
             painter.drawEllipse(left, top, w, h)
         else:
-            # VARIANT A:
-            # 1) Заливаємо ВСЮ маску темним кольором (придушуємо всю частоту)
-            dark_color = self.get_pen_color()
+            dark_color = self.get_pen_color()  # intensity from slider
             painter.setPen(Qt.NoPen)
             painter.setBrush(QBrush(dark_color, Qt.SolidPattern))
             painter.drawRect(0, 0, self.mask_image.width(), self.mask_image.height())
 
-            # 2) Колом всередині робимо біле "вікно" (там спектр не змінюється)
             painter.setBrush(QBrush(QColor(255, 255, 255), Qt.SolidPattern))
             painter.drawEllipse(left, top, w, h)
 
         painter.end()
 
-    # ---------- Undo / Redo / Reset ----------
+    # -------------------------------------------------------------------------
+    # Undo / Redo / Reset
+    # -------------------------------------------------------------------------
 
     def undo(self):
         if not self.image_loaded or not self.undo_stack:
@@ -523,69 +537,61 @@ class FourierEditor(QMainWindow):
         self.update_from_mask()
 
     def reset_mask(self):
-        """
-        Скидання всіх змін: маска = 255 (повністю біла, спектр без змін).
-        """
         if not self.image_loaded:
             return
-        h, w = self.original_image.shape
+        h, w = self.original_gray.shape
         mask_np = np.full((h, w), 255, dtype=np.uint8)
         self.mask_image = numpy_to_qimage_gray(mask_np)
         self.undo_stack.clear()
         self.redo_stack.clear()
         self.update_from_mask()
 
-    # ---------- Clipboard: Copy / Paste ----------
+    # -------------------------------------------------------------------------
+    # Save
+    # -------------------------------------------------------------------------
+
+    def save_image(self):
+        if not self.image_loaded or self.last_result_rgb is None:
+            QMessageBox.information(self, "Зберегти", "Немає що зберігати.")
+            return
+
+        fname, _ = QFileDialog.getSaveFileName(
+            self,
+            "Зберегти оброблене зображення",
+            "",
+            "PNG (*.png);;JPEG (*.jpg *.jpeg);;BMP (*.bmp);;TIFF (*.tif *.tiff);;WEBP (*.webp)",
+        )
+        if not fname:
+            return
+
+        # Save via OpenCV (needs BGR)
+        bgr = cv2.cvtColor(self.last_result_rgb, cv2.COLOR_RGB2BGR)
+        ok = cv2.imwrite(fname, bgr)
+        if not ok:
+            QMessageBox.warning(self, "Помилка", "Не вдалося зберегти файл.")
+
+    # -------------------------------------------------------------------------
+    # Clipboard
+    # -------------------------------------------------------------------------
 
     def paste_image(self):
-        """
-        Ctrl+V – вставити зображення з буфера в original.
-        """
         clipboard = QApplication.clipboard()
         img = clipboard.image()
-
         if img.isNull():
             return
 
-        arr = qimage_to_numpy_gray(img)
-        self.load_new_image(arr)
+        rgb = qimage_to_numpy_rgb(img)
+        self.load_new_image(rgb)
 
     def copy_image(self):
-        """
-        Ctrl+C – скопіювати відновлене зображення в буфер.
-        """
         if self.img_pixmap_item is None:
             return
-
         pixmap = self.img_pixmap_item.pixmap()
         QApplication.clipboard().setPixmap(pixmap)
 
-    # ---------- Drag & Drop ----------
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        if not urls:
-            return
-
-        path = urls[0].toLocalFile()
-        if not path:
-            return
-
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            return
-
-        self.load_new_image(img)
-        event.acceptProposedAction()
-
-
-# ===== Запуск програми =====
+# =============================================================================
+# Run
+# =============================================================================
 
 def main():
     app = QApplication(sys.argv)
